@@ -8,19 +8,37 @@ import torchvision
 import torchvision.models as models
 import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
+import boto3
+import os
+
+from smdebug import modes
+from smdebug.profiler.utils import str2bool
+from smdebug.pytorch import get_hook
 
 import argparse
 
 NUM_CLASSES = 133
 
-#TODO: Import dependencies for Debugging andd Profiling
+hook = get_hook(create_if_not_exists=True)
+
+def downloadDirectoryFroms3(bucketName, remoteDirectoryName):
+    '''
+    download data set from s3
+    '''
+    
+    s3_resource = boto3.resource('s3')
+    bucket = s3_resource.Bucket(bucketName) 
+    for obj in bucket.objects.filter(Prefix = remoteDirectoryName):
+        if not os.path.exists(os.path.dirname(obj.key)):
+            os.makedirs(os.path.dirname(obj.key))
+        bucket.download_file(obj.key, obj.key) # save to same path
 
 def test(model, test_loader, device):
     '''
-    TODO: Complete this function that can take a model and a 
-          testing data loader and will get the test accuray/loss of the model
-          Remember to include any debugging/profiling hooks that you might need
+    test the model
     '''
+            
+    model.eval()
     correct = 0
     total = 0
 
@@ -34,36 +52,61 @@ def test(model, test_loader, device):
             correct += (predicted == labels).sum().item()
 
     accuracy = 100 * correct / total
-    print('Accuracy: {:.2f}%'.format(accuracy))
+    print('Test Accuracy: {:.2f}'.format(accuracy))
 
-def train(model, train_loader, criterion, optimizer, device, epoch):
+def train(model, train_loader, valid_loader, criterion, optimizer, device, epoch):
     '''
-    TODO: Complete this function that can take a model and
-          data loaders for training and will get train the model
-          Remember to include any debugging/profiling hooks that you might need
+    train the model
     '''
     model.train()
     for e in range(epoch):
+        print("START TRAINING")
+        
+        if hook:
+            hook.set_mode(modes.TRAIN)
         running_loss=0
-        correct=0
+        correct_train=0
         for data, target in train_loader:
             data=data.to(device)
             target=target.to(device)
             optimizer.zero_grad()
             pred = model(data)             #No need to reshape data since CNNs take image inputs
-            loss = cost(pred, target)
+            loss = criterion(pred, target)
             running_loss+=loss
             loss.backward()
             optimizer.step()
             pred=pred.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-        print(f"Epoch {e}: Loss {running_loss/len(train_loader.dataset)}, \
-         Accuracy {100*(correct/len(train_loader.dataset))}%")
-    
+            correct_train += pred.eq(target.view_as(pred)).sum().item()
+            
+        print("START VALIDATING")
+        
+        if hook:
+            hook.set_mode(modes.EVAL)
+        model.eval()
+        correct_test = 0
+        total = 0
+        val_loss = 0
+        with torch.no_grad():
+            for images, labels in valid_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                val_loss += loss
+                _, predicted = torch.max(outputs.data, 1)
+                total += labels.size(0)
+                correct_test += (predicted == labels).sum().item()
+        print(f"Epoch {e}: \
+            Train Loss: {running_loss/len(train_loader.dataset)}, \
+            Train Accuracy: {100*(correct_train/len(train_loader.dataset))}% \
+            Val Loss: {val_loss/len(valid_loader.dataset)}, \
+            Val Accuracy: {100*(correct_test/len(valid_loader.dataset))}% \
+         ")
+    return model
+
 def net():
     '''
-    TODO: Complete this function that initializes your model
-          Remember to use a pretrained model
+    get a pre-trained model to do transfer learning
     '''
     pretrained_model = models.resnet50(pretrained=True)
     
@@ -75,34 +118,30 @@ def net():
     return pretrained_model
 
 def create_data_loaders(data, batch_size):
-    '''
-    This is an optional function that you may or may not need to implement
-    depending on whether you need to use data loaders or not
-    '''
-    pass
+    return torch.utils.data.DataLoader(data, batch_size=batch_size, shuffle=True)
 
 def main(args):
-    
-    print(args)
+
     '''
-    TODO: Initialize a model by calling the net function
+    Initialize a model by calling the net function
     '''
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Running on Device {device}")
-    
     model=net()
     model=model.to(device)
+    print('Getting the model... DONE')
     
-    '''ß
-    TODO: Create your loss and optimizer
+    '''
+    Create loss and optimizer
     '''
     loss_criterion = nn.CrossEntropyLoss()
-    print('PARAMS:',args.lr, args.momentum)
     optimizer = optim.SGD(model.fc.parameters(), lr=args.lr, momentum=args.momentum)
+    print('Creating criterion and optimizer... DONE')
     
+    if hook:
+        hook.register_loss(loss_criterion)
     '''
-    TODO: Call the train function to start training your model
-    Remember that you will need to set up a way to get training data from S3
+    train the model
     '''
     transform = transforms.Compose([
         transforms.Resize((256, 256)),
@@ -111,31 +150,35 @@ def main(args):
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     
-    train_dataset = ImageFolder(root=f's3://{args.bucket_name}/{args.train_ds_path_s3}/', transform=transform)
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    model=train(model, train_loader, loss_criterion, optimizer, device, args.epochs)
+    train_dataset = ImageFolder(root=f'{args.ds_path_s3}/train', transform=transform)
+    valid_dataset = ImageFolder(root=f'{args.ds_path_s3}/valid', transform=transform)
+    train_loader = create_data_loaders(train_dataset, args.batch_size)
+    valid_loader = create_data_loaders(valid_dataset, args.batch_size)
+    model=train(model, train_loader, valid_loader, loss_criterion, optimizer, device, args.epochs)
+    print('Training model... DONE')
     
     '''
-    TODO: Test the model to see its accuracy
+    Test the model to see its accuracy
     '''
-    test_dataset = ImageFolder(root=f's3://{args.bucket_name}/{args.test_ds_path_s3}/', transform=transform)
-    test_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    test(model, test_loader, criterion, device)
+    test_dataset = ImageFolder(root=f'{args.ds_path_s3}/test', transform=transform)
+    test_loader = create_data_loaders(test_dataset, batch_size=args.batch_size)
+    test(model, test_loader, device)
+    print('Evaluating model... DONE')
     
     '''
-    TODO: Save the trained model
+    Save the trained model
     '''
     torch.save(model, args.path)
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
-    parser.add_argument('--batch_sz', type=int)
-    parser.add_argument('--bucket_name',type=str)
-    parser.add_argument('--train_ds_path_s3',type=str)
-    parser.add_argument('--test_ds_path_s3',type=str)
-    parser.add_argument('--epochs',type=int)
+    parser.add_argument('--batch_size', type=int,default=32)
+    parser.add_argument('--bucket_name',type=str,default='sagemaker-us-east-1-272259209864')
+    parser.add_argument('--ds_path_s3',type=str,default=os.environ["SM_CHANNEL_TRAIN"])
+    parser.add_argument('--epochs',type=int,default=10)
     parser.add_argument('--lr',type=float)
-    parser.add_argument('--momentum',type=float)
+    parser.add_argument('--momentum',type=float,default=0.9)
+    parser.add_argument('--path',type=str,default='model.h5')
     '''
     TODO: Specify any training args that you might need
     '''
