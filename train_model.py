@@ -168,7 +168,13 @@ def main(args):
     '''
     Save the trained model
     '''
-    torch.save(model, args.path)
+    torch.save(
+        model.cpu().state_dict(),
+        os.path.join(
+            args.model_path,
+            "model.pth"
+        )
+    )
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser()
@@ -178,7 +184,7 @@ if __name__=='__main__':
     parser.add_argument('--epochs',type=int,default=10)
     parser.add_argument('--lr',type=float)
     parser.add_argument('--momentum',type=float,default=0.9)
-    parser.add_argument('--path',type=str,default='model.h5')
+    parser.add_argument('--model_path',type=str,default=os.environ["SM_MODEL_DIR"])
     '''
     TODO: Specify any training args that you might need
     '''
