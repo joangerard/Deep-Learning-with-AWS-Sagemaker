@@ -1,9 +1,11 @@
+import io
 import logging
 import os
 import sys
 import torch
 import torch.nn as nn
 import torchvision.models as models
+from torchvision import transforms
 from PIL import Image
 
 
@@ -19,8 +21,7 @@ def net(device):
     for param in model.parameters():
         param.requires_grad = False
 
-    num_features = model.fc.in_features
-    model.fc = nn.Linear(num_features, NUM_CLASSES)
+    model.fc = nn.Sequential(nn.Linear(model.fc.in_features, NUM_CLASSES))
 
     model = model.to(device)
     logger.info("Model creation done")
@@ -38,3 +39,15 @@ def model_fn(model_dir):
         model.load_state_dict(torch.load(f))
    
     return model
+
+def input_fn(request_body, content_type):
+    '''
+    before predicting the image do some preprocess to put the image into the correct format
+    '''
+    image = Image.open(io.BytesIO(request_body))
+
+    transformation = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor()])
+
+    return transformation(image).unsqueeze(0)

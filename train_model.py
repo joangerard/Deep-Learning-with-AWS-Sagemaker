@@ -10,6 +10,9 @@ import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
 import boto3
 import os
+import logging
+import sys
+import smdebug.pytorch as smd
 
 from smdebug import modes
 from smdebug.profiler.utils import str2bool
@@ -19,89 +22,62 @@ import argparse
 
 NUM_CLASSES = 133
 
-hook = get_hook(create_if_not_exists=True)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.StreamHandler(sys.stdout))
 
-def downloadDirectoryFroms3(bucketName, remoteDirectoryName):
-    '''
-    download data set from s3
-    '''
-    
-    s3_resource = boto3.resource('s3')
-    bucket = s3_resource.Bucket(bucketName) 
-    for obj in bucket.objects.filter(Prefix = remoteDirectoryName):
-        if not os.path.exists(os.path.dirname(obj.key)):
-            os.makedirs(os.path.dirname(obj.key))
-        bucket.download_file(obj.key, obj.key) # save to same path
-
-def test(model, test_loader, device):
+def test(model, valid_loader, criterion, device, hook):
     '''
     test the model
     '''
             
+    print("START testing")
+        
     model.eval()
-    correct = 0
+    hook.set_mode(modes.EVAL)
+    correct_test = 0
     total = 0
-
+    val_loss = 0
     with torch.no_grad():
-        for images, labels in test_loader:
+        for images, labels in valid_loader:
             images = images.to(device)
             labels = labels.to(device)
             outputs = model(images)
+            loss = criterion(outputs, labels)
+            val_loss += loss
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
-            correct += (predicted == labels).sum().item()
+            correct_test += (predicted == labels).sum().item()
+            
+    info_str = f"Val Loss: {val_loss/len(valid_loader.dataset)}, \
+            Val Accuracy: {100*(correct_test/len(valid_loader.dataset))}%"
+    logger.info(info_str)
 
-    accuracy = 100 * correct / total
-    print('Test Accuracy: {:.2f}'.format(accuracy))
-
-def train(model, train_loader, valid_loader, criterion, optimizer, device, epoch):
+def train(model, train_loader, criterion, optimizer, device, hook):
     '''
     train the model
     '''
+    print("START TRAINING")
     model.train()
-    for e in range(epoch):
-        print("START TRAINING")
+    hook.set_mode(modes.TRAIN)
+    running_loss=0
+    correct_train=0
+    for data, target in train_loader:
+        data=data.to(device)
+        target=target.to(device)
+        optimizer.zero_grad()
+        pred = model(data)             #No need to reshape data since CNNs take image inputs
+        loss = criterion(pred, target)
+        running_loss+=loss
+        loss.backward()
+        optimizer.step()
+        pred=pred.argmax(dim=1, keepdim=True)
+        correct_train += pred.eq(target.view_as(pred)).sum().item()
+
         
-        if hook:
-            hook.set_mode(modes.TRAIN)
-        running_loss=0
-        correct_train=0
-        for data, target in train_loader:
-            data=data.to(device)
-            target=target.to(device)
-            optimizer.zero_grad()
-            pred = model(data)             #No need to reshape data since CNNs take image inputs
-            loss = criterion(pred, target)
-            running_loss+=loss
-            loss.backward()
-            optimizer.step()
-            pred=pred.argmax(dim=1, keepdim=True)
-            correct_train += pred.eq(target.view_as(pred)).sum().item()
-            
-        print("START VALIDATING")
-        
-        if hook:
-            hook.set_mode(modes.EVAL)
-        model.eval()
-        correct_test = 0
-        total = 0
-        val_loss = 0
-        with torch.no_grad():
-            for images, labels in valid_loader:
-                images = images.to(device)
-                labels = labels.to(device)
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                val_loss += loss
-                _, predicted = torch.max(outputs.data, 1)
-                total += labels.size(0)
-                correct_test += (predicted == labels).sum().item()
-        print(f"Epoch {e}: \
-            Train Loss: {running_loss/len(train_loader.dataset)}, \
-            Train Accuracy: {100*(correct_train/len(train_loader.dataset))}% \
-            Val Loss: {val_loss/len(valid_loader.dataset)}, \
-            Val Accuracy: {100*(correct_test/len(valid_loader.dataset))}% \
-         ")
+        info_str = f"Train Loss: {running_loss/len(train_loader.dataset)}, \
+            Train Accuracy: {100*(correct_train/len(train_loader.dataset))}%"        
+        logger.info(info_str)
     return model
 
 def net():
@@ -122,6 +98,7 @@ def create_data_loaders(data, batch_size):
 
 def main(args):
 
+    logger.info(f'hyperparams: {args}')
     '''
     Initialize a model by calling the net function
     '''
@@ -138,8 +115,9 @@ def main(args):
     optimizer = optim.SGD(model.fc.parameters(), lr=args.lr, momentum=args.momentum)
     print('Creating criterion and optimizer... DONE')
     
-    if hook:
-        hook.register_loss(loss_criterion)
+    hook = smd.Hook.create_from_json_file()
+    hook.register_module(model)
+    hook.register_loss(loss_criterion)
     '''
     train the model
     '''
@@ -154,16 +132,12 @@ def main(args):
     valid_dataset = ImageFolder(root=f'{args.ds_path_s3}/valid', transform=transform)
     train_loader = create_data_loaders(train_dataset, args.batch_size)
     valid_loader = create_data_loaders(valid_dataset, args.batch_size)
-    model=train(model, train_loader, valid_loader, loss_criterion, optimizer, device, args.epochs)
+    for e in range(args.epochs):
+        train(model, train_loader,loss_criterion, optimizer, device, hook)
+        test(model, valid_loader, loss_criterion, device, hook)
+        
     print('Training model... DONE')
     
-    '''
-    Test the model to see its accuracy
-    '''
-    test_dataset = ImageFolder(root=f'{args.ds_path_s3}/test', transform=transform)
-    test_loader = create_data_loaders(test_dataset, batch_size=args.batch_size)
-    test(model, test_loader, device)
-    print('Evaluating model... DONE')
     
     '''
     Save the trained model
@@ -185,9 +159,6 @@ if __name__=='__main__':
     parser.add_argument('--lr',type=float)
     parser.add_argument('--momentum',type=float,default=0.9)
     parser.add_argument('--model_path',type=str,default=os.environ["SM_MODEL_DIR"])
-    '''
-    TODO: Specify any training args that you might need
-    '''
     
     args=parser.parse_args()
     

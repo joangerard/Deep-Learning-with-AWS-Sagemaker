@@ -10,21 +10,16 @@ import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
 import boto3
 import os
+import sys
+import logging
 
 import argparse
 
 NUM_CLASSES = 133
 
-def downloadDirectoryFroms3(bucketName, remoteDirectoryName):
-    '''
-    download data set from s3
-    '''
-    s3_resource = boto3.resource('s3')
-    bucket = s3_resource.Bucket(bucketName) 
-    for obj in bucket.objects.filter(Prefix = remoteDirectoryName):
-        if not os.path.exists(os.path.dirname(obj.key)):
-            os.makedirs(os.path.dirname(obj.key))
-        bucket.download_file(obj.key, obj.key) # save to same path
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(logging.StreamHandler(sys.stdout))
 
 def test(model, test_loader, device):
     '''
@@ -45,6 +40,7 @@ def test(model, test_loader, device):
 
     accuracy = 100 * correct / total
     print('Test Accuracy: {:.2f}'.format(accuracy))
+    logger.info('Test Accuracy: {:.2f}'.format(accuracy))
 
 def train(model, train_loader, criterion, optimizer, device, epoch):
     '''
@@ -65,9 +61,10 @@ def train(model, train_loader, criterion, optimizer, device, epoch):
             optimizer.step()
             pred=pred.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
-            
-        print(f"Epoch {e}: Loss {running_loss/len(train_loader.dataset)}, \
-         Accuracy {100*(correct/len(train_loader.dataset))}%")
+        info_str = f"Epoch {e}: Loss {running_loss/len(train_loader.dataset)}, \
+         Accuracy {100*(correct/len(train_loader.dataset))}%"
+        print(info_str)
+        logger.info(info_str)
     return model
 
 def net():
@@ -88,6 +85,7 @@ def create_data_loaders(data, batch_size):
 
 def main(args):
 
+    logger.info(f'hyperparams: {args}')
     '''
     Initialize a model by calling the net function
     '''
