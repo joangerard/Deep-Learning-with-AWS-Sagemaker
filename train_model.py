@@ -36,7 +36,6 @@ def test(model, valid_loader, criterion, device, hook):
     model.eval()
     hook.set_mode(modes.EVAL)
     correct_test = 0
-    total = 0
     val_loss = 0
     with torch.no_grad():
         for images, labels in valid_loader:
@@ -45,9 +44,8 @@ def test(model, valid_loader, criterion, device, hook):
             outputs = model(images)
             loss = criterion(outputs, labels)
             val_loss += loss
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct_test += (predicted == labels).sum().item()
+            pred=outputs.argmax(dim=1, keepdim=True)
+            correct_test += pred.eq(labels.view_as(pred)).sum().item()
             
     info_str = f"Val Loss: {val_loss/len(valid_loader.dataset)}, \
             Val Accuracy: {100*(correct_test/len(valid_loader.dataset))}%"
@@ -74,11 +72,9 @@ def train(model, train_loader, criterion, optimizer, device, hook):
         pred=pred.argmax(dim=1, keepdim=True)
         correct_train += pred.eq(target.view_as(pred)).sum().item()
 
-        
-        info_str = f"Train Loss: {running_loss/len(train_loader.dataset)}, \
-            Train Accuracy: {100*(correct_train/len(train_loader.dataset))}%"        
-        logger.info(info_str)
-    return model
+    info_str = f"Train Loss: {running_loss/len(train_loader.dataset)}, \
+        Train Accuracy: {100*(correct_train/len(train_loader.dataset))}%"        
+    logger.info(info_str
 
 def net():
     '''
@@ -89,12 +85,12 @@ def net():
     for param in pretrained_model.parameters():
         param.requires_grad = False
         
-    pretrained_model.fc = nn.Sequential(nn.Linear(pretrained_model.fc.in_features, NUM_CLASSES))
+    pretrained_model.fc = nn.Linear(pretrained_model.fc.in_features, NUM_CLASSES)
     
     return pretrained_model
 
-def create_data_loaders(data, batch_size):
-    return torch.utils.data.DataLoader(data, batch_size=batch_size, shuffle=True)
+def create_data_loaders(data, batch_size, shuffle):
+    return torch.utils.data.DataLoader(data, batch_size=batch_size, shuffle=shuffle)
 
 def main(args):
 
@@ -121,17 +117,26 @@ def main(args):
     '''
     train the model
     '''
-    transform = transforms.Compose([
+    transform_train = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+                
+    transform_test = transforms.Compose([
         transforms.Resize((256, 256)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
     
-    train_dataset = ImageFolder(root=f'{args.ds_path_s3}/train', transform=transform)
-    valid_dataset = ImageFolder(root=f'{args.ds_path_s3}/valid', transform=transform)
-    train_loader = create_data_loaders(train_dataset, args.batch_size)
-    valid_loader = create_data_loaders(valid_dataset, args.batch_size)
+    train_dataset = ImageFolder(root=f'{args.ds_path_s3}/train', transform=transform_train)
+    valid_dataset = ImageFolder(root=f'{args.ds_path_s3}/valid', transform=transform_test)
+                
+    train_loader = create_data_loaders(train_dataset, args.batch_size, True)
+    valid_loader = create_data_loaders(valid_dataset, args.batch_size, False)
+                
     for e in range(args.epochs):
         train(model, train_loader,loss_criterion, optimizer, device, hook)
         test(model, valid_loader, loss_criterion, device, hook)
